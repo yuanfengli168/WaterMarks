@@ -2,7 +2,7 @@ import { useState, useRef } from 'react';
 import { Upload, AlertCircle, CheckCircle, Loader2, Download, X } from 'lucide-react';
 
 // Types
-type ProcessingStatus = 'idle' | 'uploading' | 'uploaded' | 'splitting' | 'splitted' | 'watermarking' | 'completed' | 'error';
+type ProcessingStatus = 'idle' | 'uploading' | 'splitting' | 'adding_watermarks' | 'finished' | 'error';
 
 interface HistoryItem {
   id: string;
@@ -10,6 +10,8 @@ interface HistoryItem {
   originalName: string;
   watermarkedName: string;
   downloadUrl: string;
+  downloadFailed: boolean;
+  jobId?: string;
 }
 
 export default function App() {
@@ -17,10 +19,17 @@ export default function App() {
   const [chunkSize, setChunkSize] = useState('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [processingStatus, setProcessingStatus] = useState<ProcessingStatus>('idle');
+  const [progress, setProgress] = useState(0);
   const [errorMessage, setErrorMessage] = useState('');
+  const [homeErrorMessage, setHomeErrorMessage] = useState('');
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [usedColors, setUsedColors] = useState<Set<string>>(new Set());
+  const [currentJobId, setCurrentJobId] = useState<string | null>(null);
+  const [showDownloadButton, setShowDownloadButton] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const pollingRef = useRef<NodeJS.Timeout | null>(null);
+
+  const API_BASE = 'http://localhost:8000';
 
   // Color pool for watermarks
   const colorPool = [
@@ -45,78 +54,253 @@ export default function App() {
     e.preventDefault();
     
     if (!chunkSize || isNaN(Number(chunkSize)) || Number(chunkSize) <= 0) {
-      alert('Chunk Size need to be filled (e.g. 5 pages)');
+      setHomeErrorMessage('Chunk Size need to be filled (e.g. 5 pages)');
       return;
     }
 
+    setHomeErrorMessage('');
     fileInputRef.current?.click();
   };
 
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file && file.type === 'application/pdf') {
+    if (!file) return;
+
+    if (file.type !== 'application/pdf') {
+      setHomeErrorMessage('Invalid file type. Only PDF files are allowed.');
+      return;
+    }
+
+    // Check file size before proceeding
+    try {
+      const response = await fetch(`${API_BASE}/api/check-size`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file_size: file.size })
+      });
+
+      const data = await response.json();
+      
+      if (!data.allowed) {
+        setHomeErrorMessage(data.message || 'File is too large');
+        return;
+      }
+
+      // Size check passed, proceed to processing
       setSelectedFile(file);
+      setHomeErrorMessage('');
       setCurrentStage('processing');
       startProcessing(file);
+    } catch (error) {
+      setHomeErrorMessage('Failed to check file size. Please try again.');
+      console.error('Size check error:', error);
     }
   };
 
   const startProcessing = async (file: File) => {
     try {
-      // Simulate uploading
       setProcessingStatus('uploading');
-      await delay(1500);
-      
-      setProcessingStatus('uploaded');
-      await delay(500);
-      
-      // Simulate splitting
-      setProcessingStatus('splitting');
-      await delay(2000);
-      
-      setProcessingStatus('splitted');
-      await delay(500);
-      
-      // Simulate watermarking
-      setProcessingStatus('watermarking');
-      await delay(2500);
-      
-      // Generate colors for chunks
-      const numChunks = Math.ceil(100 / Number(chunkSize)); // Assuming 100 pages for demo
-      for (let i = 0; i < numChunks; i++) {
-        getNextColor();
+      setProgress(0);
+      setShowDownloadButton(false);
+
+      // Upload file
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('chunk_size', chunkSize);
+
+      const uploadResponse = await fetch(`${API_BASE}/api/upload`, {
+        method: 'POST',
+        body: formData
+      });
+
+      if (!uploadResponse.ok) {
+        const errorData = await uploadResponse.json().catch(() => ({}));
+        throw new Error(errorData.detail || 'Upload failed');
       }
-      
-      setProcessingStatus('completed');
-      
-      // Add to history
-      const watermarkedName = file.name.replace('.pdf', '-watermarked.pdf');
-      const newItem: HistoryItem = {
-        id: Date.now().toString(),
-        timestamp: new Date(),
-        originalName: file.name,
-        watermarkedName: watermarkedName,
-        downloadUrl: URL.createObjectURL(file) // Mock URL
-      };
-      setHistory([newItem, ...history]);
-      
-    } catch (error) {
+
+      const { job_id } = await uploadResponse.json();
+      setCurrentJobId(job_id);
+
+      // Start polling for status
+      pollStatus(job_id, file.name);
+
+    } catch (error: any) {
       setProcessingStatus('error');
-      setErrorMessage('Error occurred: Failed to process PDF file.');
+      setErrorMessage(error.message || 'Failed to upload file');
+      console.error('Upload error:', error);
     }
   };
 
-  const handleAbort = () => {
+  const pollStatus = async (jobId: string, originalFileName: string) => {
+    try {
+      const response = await fetch(`${API_BASE}/api/status/${jobId}`);
+      
+      if (!response.ok) {
+        throw new Error('Failed to fetch status');
+      }
+
+      const data = await response.json();
+
+      // Update status and progress
+      if (data.status === 'error') {
+        setProcessingStatus('error');
+        setErrorMessage(data.error || 'An error occurred during processing');
+        if (pollingRef.current) {
+          clearTimeout(pollingRef.current);
+        }
+        return;
+      }
+
+      setProcessingStatus(data.status as ProcessingStatus);
+      setProgress(data.progress || 0);
+
+      if (data.status === 'finished') {
+        // Stop polling
+        if (pollingRef.current) {
+          clearTimeout(pollingRef.current);
+        }
+
+        // Attempt automatic download
+        await handleAutoDownload(jobId, originalFileName);
+      } else {
+        // Continue polling every 1 second
+        pollingRef.current = setTimeout(() => pollStatus(jobId, originalFileName), 1000);
+      }
+    } catch (error) {
+      console.error('Polling error:', error);
+      setProcessingStatus('error');
+      setErrorMessage('Failed to check processing status');
+      if (pollingRef.current) {
+        clearTimeout(pollingRef.current);
+      }
+    }
+  };
+
+  const handleAutoDownload = async (jobId: string, originalFileName: string) => {
+    try {
+      const response = await fetch(`${API_BASE}/api/download/${jobId}`);
+      
+      if (!response.ok) {
+        throw new Error('Download failed');
+      }
+
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const watermarkedName = originalFileName.replace('.pdf', '-watermarked.pdf');
+      
+      // Trigger download
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = watermarkedName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      // Cleanup on backend
+      await fetch(`${API_BASE}/api/cleanup/${jobId}`, { method: 'DELETE' });
+
+      // Add to history without download button
+      const newItem: HistoryItem = {
+        id: Date.now().toString(),
+        timestamp: new Date(),
+        originalName: originalFileName,
+        watermarkedName: watermarkedName,
+        downloadUrl: '',
+        downloadFailed: false
+      };
+      setHistory([newItem, ...history]);
+
+    } catch (error) {
+      console.error('Auto-download failed:', error);
+      setShowDownloadButton(true);
+      
+      // Add to history with download button enabled
+      const watermarkedName = originalFileName.replace('.pdf', '-watermarked.pdf');
+      const newItem: HistoryItem = {
+        id: Date.now().toString(),
+        timestamp: new Date(),
+        originalName: originalFileName,
+        watermarkedName: watermarkedName,
+        downloadUrl: '',
+        downloadFailed: true,
+        jobId: jobId
+      };
+      setHistory([newItem, ...history]);
+      
+      setErrorMessage('Automatic download failed. Please use the download button.');
+    }
+  };
+
+  const handleManualDownload = async (jobId: string, fileName: string) => {
+    try {
+      const response = await fetch(`${API_BASE}/api/download/${jobId}`);
+      
+      if (!response.ok) {
+        throw new Error('Download failed');
+      }
+
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      // Cleanup on backend
+      await fetch(`${API_BASE}/api/cleanup/${jobId}`, { method: 'DELETE' });
+
+      // Update history item to mark download as successful
+      setHistory(history.map(item => 
+        item.jobId === jobId ? { ...item, downloadFailed: false, jobId: undefined } : item
+      ));
+      setShowDownloadButton(false);
+
+    } catch (error) {
+      console.error('Manual download failed:', error);
+      alert('Download failed. Please try again.');
+    }
+  };
+
+  const handleAbort = async () => {
+    // Stop polling
+    if (pollingRef.current) {
+      clearTimeout(pollingRef.current);
+      pollingRef.current = null;
+    }
+
+    // Cleanup job if exists
+    if (currentJobId) {
+      try {
+        await fetch(`${API_BASE}/api/cleanup/${currentJobId}`, { method: 'DELETE' });
+      } catch (error) {
+        console.error('Cleanup error:', error);
+      }
+    }
+
     setProcessingStatus('error');
-    setErrorMessage('Error occurred: Process aborted by user.');
+    setErrorMessage('Process aborted by user.');
   };
 
   const handleOk = () => {
+    // Stop any active polling
+    if (pollingRef.current) {
+      clearTimeout(pollingRef.current);
+      pollingRef.current = null;
+    }
+
     setCurrentStage('home');
     setProcessingStatus('idle');
+    setProgress(0);
     setSelectedFile(null);
     setErrorMessage('');
     setChunkSize('');
+    setCurrentJobId(null);
+    setShowDownloadButton(false);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -145,6 +329,16 @@ export default function App() {
               <h1 className="text-3xl font-bold text-gray-800 mb-8 leading-tight">
                 Please upload your pdf here, and choose your chunk size to add colorful water marks!
               </h1>
+              
+              {/* Error message display */}
+              {homeErrorMessage && (
+                <div className="max-w-md mx-auto mb-6 p-4 bg-red-50 border-2 border-red-500 rounded-lg">
+                  <div className="flex items-start gap-3">
+                    <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+                    <div className="text-sm text-red-700 text-left">{homeErrorMessage}</div>
+                  </div>
+                </div>
+              )}
               
               <form onSubmit={handleUploadClick} className="max-w-md mx-auto space-y-6">
                 <div className="space-y-2">
@@ -185,7 +379,7 @@ export default function App() {
               <div className="mt-12 pt-8 border-t-2 border-gray-200">
                 <h2 className="text-xl font-semibold text-gray-800 mb-6">Processing History</h2>
                 <div className="space-y-3">
-                  {history.map((item) => (
+                  {history.map((item, index) => (
                     <div
                       key={item.id}
                       className="bg-gray-50 rounded-lg p-4 flex items-center justify-between hover:bg-gray-100 transition-colors"
@@ -198,14 +392,16 @@ export default function App() {
                           {item.watermarkedName}
                         </div>
                       </div>
-                      <a
-                        href={item.downloadUrl}
-                        download={item.watermarkedName}
-                        className="ml-4 bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition-colors duration-200 flex items-center gap-2 shadow-md hover:shadow-lg"
-                      >
-                        <Download className="w-4 h-4" />
-                        Download
-                      </a>
+                      {/* Show download button only for most recent item if download failed */}
+                      {index === 0 && item.downloadFailed && item.jobId && (
+                        <button
+                          onClick={() => handleManualDownload(item.jobId!, item.watermarkedName)}
+                          className="ml-4 bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition-colors duration-200 flex items-center gap-2 shadow-md hover:shadow-lg"
+                        >
+                          <Download className="w-4 h-4" />
+                          Download
+                        </button>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -226,31 +422,34 @@ export default function App() {
               <ProcessingStep
                 status={processingStatus}
                 currentStep="uploading"
-                completedSteps={['uploaded', 'splitting', 'splitted', 'watermarking', 'completed']}
+                completedSteps={['splitting', 'adding_watermarks', 'finished']}
                 label="Uploading"
+                progress={progress}
               />
               
-              {/* Uploaded, splitting the PDF */}
+              {/* Splitting the PDF */}
               <ProcessingStep
                 status={processingStatus}
                 currentStep="splitting"
-                completedSteps={['splitted', 'watermarking', 'completed']}
-                label="Uploaded, splitting the PDF"
-                requiredStep="uploaded"
+                completedSteps={['adding_watermarks', 'finished']}
+                label="Splitting the PDF"
+                requiredStep="uploading"
+                progress={progress}
               />
               
-              {/* Splitted, adding watermarks */}
+              {/* Adding watermarks */}
               <ProcessingStep
                 status={processingStatus}
-                currentStep="watermarking"
-                completedSteps={['completed']}
-                label="Splitted, adding watermarks"
-                requiredStep="splitted"
+                currentStep="adding_watermarks"
+                completedSteps={['finished']}
+                label="Adding watermarks"
+                requiredStep="splitting"
+                progress={progress}
               />
               
               {/* Completed - Always reserve space */}
               <div className="min-h-[72px] flex items-center">
-                {processingStatus === 'completed' && (
+                {processingStatus === 'finished' && (
                   <div className="flex items-center gap-4 p-4 bg-green-50 rounded-lg border-2 border-green-500 w-full">
                     <CheckCircle className="w-6 h-6 text-green-600 flex-shrink-0" />
                     <span className="text-lg font-medium text-green-800">Completed</span>
@@ -270,12 +469,25 @@ export default function App() {
                   </div>
                 )}
               </div>
+
+              {/* Manual Download Button */}
+              {showDownloadButton && currentJobId && selectedFile && (
+                <div className="flex justify-center">
+                  <button
+                    onClick={() => handleManualDownload(currentJobId, selectedFile.name.replace('.pdf', '-watermarked.pdf'))}
+                    className="bg-green-600 hover:bg-green-700 text-white font-semibold py-3 px-8 rounded-lg transition-colors duration-200 flex items-center gap-2 shadow-md"
+                  >
+                    <Download className="w-5 h-5" />
+                    Download PDF
+                  </button>
+                </div>
+              )}
             </div>
             
             <div className="flex gap-4 justify-center">
               <button
                 onClick={handleAbort}
-                disabled={processingStatus === 'completed' || processingStatus === 'error'}
+                disabled={processingStatus === 'finished' || processingStatus === 'error'}
                 className="bg-red-600 hover:bg-red-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white font-semibold py-3 px-8 rounded-lg transition-colors duration-200 flex items-center gap-2 shadow-md"
               >
                 <X className="w-5 h-5" />
@@ -284,7 +496,7 @@ export default function App() {
               
               <button
                 onClick={handleOk}
-                disabled={processingStatus !== 'completed' && processingStatus !== 'error'}
+                disabled={processingStatus !== 'finished' && processingStatus !== 'error'}
                 className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white font-semibold py-3 px-8 rounded-lg transition-colors duration-200 shadow-md"
               >
                 OK
@@ -303,10 +515,11 @@ interface ProcessingStepProps {
   completedSteps: ProcessingStatus[];
   label: string;
   requiredStep?: ProcessingStatus;
+  progress?: number;
 }
 
-function ProcessingStep({ status, currentStep, completedSteps, label, requiredStep }: ProcessingStepProps) {
-  const stepOrder: ProcessingStatus[] = ['idle', 'uploading', 'uploaded', 'splitting', 'splitted', 'watermarking', 'completed'];
+function ProcessingStep({ status, currentStep, completedSteps, label, requiredStep, progress = 0 }: ProcessingStepProps) {
+  const stepOrder: ProcessingStatus[] = ['idle', 'uploading', 'splitting', 'adding_watermarks', 'finished'];
   const currentIndex = stepOrder.indexOf(status);
   const requiredIndex = requiredStep ? stepOrder.indexOf(requiredStep) : -1;
   
@@ -317,7 +530,7 @@ function ProcessingStep({ status, currentStep, completedSteps, label, requiredSt
   const isCompleted = completedSteps.includes(status);
   
   return (
-    <div className={`flex items-center gap-4 p-4 rounded-lg border-2 transition-all duration-300 min-h-[72px] ${
+    <div className={`rounded-lg border-2 transition-all duration-300 min-h-[72px] ${
       !isVisible
         ? 'opacity-0 pointer-events-none bg-white border-gray-200'
         : isActive 
@@ -326,18 +539,32 @@ function ProcessingStep({ status, currentStep, completedSteps, label, requiredSt
         ? 'bg-gray-50 border-gray-300' 
         : 'bg-white border-gray-200'
     }`}>
-      {isActive ? (
-        <Loader2 className="w-6 h-6 text-blue-600 animate-spin flex-shrink-0" />
-      ) : isCompleted ? (
-        <CheckCircle className="w-6 h-6 text-gray-400 flex-shrink-0" />
-      ) : (
-        <div className="w-6 h-6 rounded-full border-2 border-gray-300 flex-shrink-0" />
+      <div className="flex items-center gap-4 p-4">
+        {isActive ? (
+          <Loader2 className="w-6 h-6 text-blue-600 animate-spin flex-shrink-0" />
+        ) : isCompleted ? (
+          <CheckCircle className="w-6 h-6 text-gray-400 flex-shrink-0" />
+        ) : (
+          <div className="w-6 h-6 rounded-full border-2 border-gray-300 flex-shrink-0" />
+        )}
+        <span className={`text-lg font-medium ${
+          isActive ? 'text-blue-800' : isCompleted ? 'text-gray-600' : 'text-gray-400'
+        }`}>
+          {label}
+        </span>
+      </div>
+      {/* Progress bar for active step */}
+      {isActive && progress > 0 && (
+        <div className="px-4 pb-4">
+          <div className="w-full bg-blue-200 rounded-full h-2.5">
+            <div 
+              className="bg-blue-600 h-2.5 rounded-full transition-all duration-300"
+              style={{ width: `${progress}%` }}
+            ></div>
+          </div>
+          <div className="text-xs text-blue-600 mt-1 text-right">{progress}%</div>
+        </div>
       )}
-      <span className={`text-lg font-medium ${
-        isActive ? 'text-blue-800' : isCompleted ? 'text-gray-600' : 'text-gray-400'
-      }`}>
-        {label}
-      </span>
     </div>
   );
 }
