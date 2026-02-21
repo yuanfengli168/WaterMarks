@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { Upload, AlertCircle, CheckCircle, Loader2, Download, X } from 'lucide-react';
 
 // Types
-type ProcessingStatus = 'idle' | 'queued' | 'uploading' | 'splitting' | 'adding_watermarks' | 'merging' | 'downloading' | 'finished' | 'error';
+type ProcessingStatus = 'idle' | 'checking_queue' | 'queue_full_waiting' | 'queued' | 'uploading' | 'splitting' | 'adding_watermarks' | 'merging' | 'downloading' | 'finished' | 'error';
 
 interface HistoryItem {
   id: string;
@@ -21,6 +21,25 @@ interface QueueInfo {
   estimatedWaitSeconds: number | null;
 }
 
+interface CheckSizeResponse {
+  allowed: boolean;
+  max_allowed_size: number;
+  available_ram: number;
+  message: string;
+  queue_available: boolean;
+  queue_message: string;
+  retry_after_seconds: number | null;
+  queue_count: number;
+  active_jobs: number;
+}
+
+interface QueueWaitInfo {
+  activeJobs: number;
+  queueCount: number;
+  retryAfterSeconds: number;
+  countdownSeconds: number;
+}
+
 export default function App() {
   const [currentStage, setCurrentStage] = useState<'home' | 'processing'>('home');
   const [chunkSize, setChunkSize] = useState('');
@@ -35,10 +54,13 @@ export default function App() {
   const [showDownloadButton, setShowDownloadButton] = useState(false);
   const [showExpiryWarning, setShowExpiryWarning] = useState(false);
   const [queueInfo, setQueueInfo] = useState<QueueInfo | null>(null);
+  const [queueWaitInfo, setQueueWaitInfo] = useState<QueueWaitInfo | null>(null);
   const [backendAwake, setBackendAwake] = useState(false);
   const [wakingBackend, setWakingBackend] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollingRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const queueCheckIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const queueCheckTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Use environment variable for API URL, fallback to localhost for development
   // In production (GitHub Pages), use the Render backend URL
@@ -59,6 +81,13 @@ export default function App() {
           clearTimeout(item.expiryTimer);
         }
       });
+      // Clear queue check intervals
+      if (queueCheckIntervalRef.current) {
+        clearInterval(queueCheckIntervalRef.current);
+      }
+      if (queueCheckTimeoutRef.current) {
+        clearTimeout(queueCheckTimeoutRef.current);
+      }
     };
   }, [history]);
 
@@ -125,6 +154,89 @@ export default function App() {
     return color;
   };
 
+  const checkQueueAvailability = async (file: File): Promise<CheckSizeResponse> => {
+    const response = await fetch(`${API_BASE}/api/check-size`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_size: file.size })
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to check queue availability');
+    }
+
+    return await response.json();
+  };
+
+  const waitForQueueSpace = async (file: File): Promise<boolean> => {
+    return new Promise((resolve) => {
+      const checkAndWait = async () => {
+        try {
+          const checkResult = await checkQueueAvailability(file);
+
+          // If file is not allowed (too large), stop waiting
+          if (!checkResult.allowed && checkResult.queue_available) {
+            setProcessingStatus('error');
+            setErrorMessage(checkResult.message);
+            resolve(false);
+            return;
+          }
+
+          // If queue is available now, proceed
+          if (checkResult.queue_available) {
+            setQueueWaitInfo(null);
+            resolve(true);
+            return;
+          }
+
+          // Queue still full - update wait info and continue
+          const retrySeconds = checkResult.retry_after_seconds || 30;
+          setQueueWaitInfo({
+            activeJobs: checkResult.active_jobs,
+            queueCount: checkResult.queue_count,
+            retryAfterSeconds: retrySeconds,
+            countdownSeconds: retrySeconds
+          });
+
+          // Start countdown
+          if (queueCheckIntervalRef.current) {
+            clearInterval(queueCheckIntervalRef.current);
+          }
+
+          queueCheckIntervalRef.current = setInterval(() => {
+            setQueueWaitInfo(prev => {
+              if (!prev || prev.countdownSeconds <= 1) {
+                return prev;
+              }
+              return {
+                ...prev,
+                countdownSeconds: prev.countdownSeconds - 1
+              };
+            });
+          }, 1000);
+
+          // Schedule next check
+          if (queueCheckTimeoutRef.current) {
+            clearTimeout(queueCheckTimeoutRef.current);
+          }
+
+          queueCheckTimeoutRef.current = setTimeout(() => {
+            checkAndWait();
+          }, retrySeconds * 1000);
+
+        } catch (error) {
+          console.error('Queue check error:', error);
+          setProcessingStatus('error');
+          setErrorMessage('Failed to check queue status. Please try again.');
+          resolve(false);
+        }
+      };
+
+      checkAndWait();
+    });
+  };
+
   const handleUploadClick = (e: React.FormEvent) => {
     e.preventDefault();
     
@@ -146,40 +258,83 @@ export default function App() {
       return;
     }
 
-    // Check file size before proceeding
-    try {
-      const response = await fetch(`${API_BASE}/api/check-size`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file_size: file.size })
-      });
+    // Move to processing stage and start queue checking
+    setSelectedFile(file);
+    setHomeErrorMessage('');
+    setCurrentStage('processing');
+    setProcessingStatus('checking_queue');
+    setProgress(0);
+    setShowDownloadButton(false);
+    setShowExpiryWarning(false);
+    setQueueInfo(null);
+    setQueueWaitInfo(null);
 
-      const data = await response.json();
-      
-      if (!data.allowed) {
-        setHomeErrorMessage(data.message || 'File is too large');
+    // Check queue availability before uploading
+    try {
+      const checkResult = await checkQueueAvailability(file);
+
+      // File too large - stop immediately
+      if (!checkResult.allowed && checkResult.queue_available) {
+        setProcessingStatus('error');
+        setErrorMessage(checkResult.message);
         return;
       }
 
-      // Size check passed, proceed to processing
-      setSelectedFile(file);
-      setHomeErrorMessage('');
-      setCurrentStage('processing');
-      startProcessing(file);
+      // Queue available - proceed with upload
+      if (checkResult.queue_available) {
+        startProcessing(file);
+        return;
+      }
+
+      // Queue full - check if we should wait
+      if (checkResult.queue_count >= 10) {
+        // Too many jobs - show error and stop
+        const retryMinutes = checkResult.retry_after_seconds 
+          ? Math.ceil(checkResult.retry_after_seconds / 60) 
+          : 5;
+        setProcessingStatus('error');
+        setErrorMessage(
+          `Server is very busy (${checkResult.queue_count} jobs in queue). ` +
+          `Please try again in ${retryMinutes} minute${retryMinutes !== 1 ? 's' : ''}.`
+        );
+        return;
+      }
+
+      // Queue full but < 10 jobs - wait for space
+      setProcessingStatus('queue_full_waiting');
+      const spaceAvailable = await waitForQueueSpace(file);
+      
+      if (spaceAvailable) {
+        // Space became available - start upload
+        startProcessing(file);
+      }
+      // If not available, error is already set by waitForQueueSpace
+
     } catch (error) {
-      setHomeErrorMessage('Failed to check file size. Please try again.');
-      console.error('Size check error:', error);
+      console.error('Queue check error:', error);
+      setProcessingStatus('error');
+      setErrorMessage('Failed to check queue status. Please try again.');
     }
   };
 
   const startProcessing = async (file: File) => {
     try {
+      // Clear any existing queue check intervals
+      if (queueCheckIntervalRef.current) {
+        clearInterval(queueCheckIntervalRef.current);
+        queueCheckIntervalRef.current = null;
+      }
+      if (queueCheckTimeoutRef.current) {
+        clearTimeout(queueCheckTimeoutRef.current);
+        queueCheckTimeoutRef.current = null;
+      }
+
       setProcessingStatus('uploading');
       setProgress(0);
       setShowDownloadButton(false);
       setShowExpiryWarning(false);
       setQueueInfo(null);
+      setQueueWaitInfo(null);
 
       // Upload file with XMLHttpRequest to track progress
       const formData = new FormData();
@@ -220,17 +375,22 @@ export default function App() {
         xhr.send(formData);
       });
 
-      // Handle 503 Server Busy
+      // Handle 503 Server Busy (race condition - queue filled during upload)
       if (uploadResponse.status === 503) {
         const errorData = await uploadResponse.json().catch(() => ({}));
-        const retryMinutes = errorData.retry_after_seconds 
-          ? Math.ceil(errorData.retry_after_seconds / 60) 
-          : 5;
-        setProcessingStatus('error');
-        setErrorMessage(
-          errorData.message || 
-          `Server is at capacity. Please try again in ${retryMinutes} minute${retryMinutes > 1 ? 's' : ''}.`
-        );
+        const detail = errorData.detail || errorData;
+        
+        // Re-check queue and wait for space
+        setProcessingStatus('queue_full_waiting');
+        
+        const spaceAvailable = await waitForQueueSpace(file);
+        
+        if (spaceAvailable) {
+          // Space became available - retry upload
+          await startProcessing(file);
+        } else {
+          // Error already set by waitForQueueSpace or user cancelled
+        }
         return;
       }
 
@@ -466,6 +626,16 @@ export default function App() {
       pollingRef.current = null;
     }
 
+    // Clear queue check intervals
+    if (queueCheckIntervalRef.current) {
+      clearInterval(queueCheckIntervalRef.current);
+      queueCheckIntervalRef.current = null;
+    }
+    if (queueCheckTimeoutRef.current) {
+      clearTimeout(queueCheckTimeoutRef.current);
+      queueCheckTimeoutRef.current = null;
+    }
+
     // Cleanup job if exists
     if (currentJobId) {
       try {
@@ -479,6 +649,7 @@ export default function App() {
 
     setProcessingStatus('error');
     setErrorMessage('Process aborted by user.');
+    setQueueWaitInfo(null);
   };
 
   const handleOk = () => {
@@ -486,6 +657,16 @@ export default function App() {
     if (pollingRef.current) {
       clearTimeout(pollingRef.current);
       pollingRef.current = null;
+    }
+
+    // Clear queue check intervals
+    if (queueCheckIntervalRef.current) {
+      clearInterval(queueCheckIntervalRef.current);
+      queueCheckIntervalRef.current = null;
+    }
+    if (queueCheckTimeoutRef.current) {
+      clearTimeout(queueCheckTimeoutRef.current);
+      queueCheckTimeoutRef.current = null;
     }
 
     setCurrentStage('home');
@@ -498,6 +679,7 @@ export default function App() {
     setShowDownloadButton(false);
     setShowExpiryWarning(false);
     setQueueInfo(null);
+    setQueueWaitInfo(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -642,9 +824,15 @@ export default function App() {
                 status={processingStatus}
                 currentStep="queued"
                 completedSteps={['uploading', 'splitting', 'adding_watermarks', 'merging', 'downloading', 'finished']}
-                label={queueInfo 
-                  ? `Queued - Position #${queueInfo.position} (${queueInfo.jobsAhead} job${queueInfo.jobsAhead !== 1 ? 's' : ''} ahead${queueInfo.estimatedWaitSeconds ? `, ~${Math.ceil(queueInfo.estimatedWaitSeconds / 60)} min` : ''})`
-                  : "Queued"}
+                label={
+                  processingStatus === 'checking_queue' 
+                    ? 'Checking queue availability...'
+                    : processingStatus === 'queue_full_waiting' && queueWaitInfo
+                    ? `Waiting for queue space (${queueWaitInfo.activeJobs} processing, ${queueWaitInfo.queueCount} queued) - Retry in ${Math.floor(queueWaitInfo.countdownSeconds / 60)}:${(queueWaitInfo.countdownSeconds % 60).toString().padStart(2, '0')}`
+                    : queueInfo 
+                    ? `Queued - Position #${queueInfo.position} (${queueInfo.jobsAhead} job${queueInfo.jobsAhead !== 1 ? 's' : ''} ahead${queueInfo.estimatedWaitSeconds ? `, ~${Math.ceil(queueInfo.estimatedWaitSeconds / 60)} min` : ''})`
+                    : 'Queued'
+                }
                 progress={0}
               />
               
@@ -785,14 +973,16 @@ interface ProcessingStepProps {
 }
 
 function ProcessingStep({ status, currentStep, completedSteps, label, requiredStep, progress = 0 }: ProcessingStepProps) {
-  const stepOrder: ProcessingStatus[] = ['idle', 'queued', 'uploading', 'splitting', 'adding_watermarks', 'merging', 'downloading', 'finished'];
+  const stepOrder: ProcessingStatus[] = ['idle', 'checking_queue', 'queue_full_waiting', 'queued', 'uploading', 'splitting', 'adding_watermarks', 'merging', 'downloading', 'finished'];
   const currentIndex = stepOrder.indexOf(status);
   const requiredIndex = requiredStep ? stepOrder.indexOf(requiredStep) : -1;
   
   // Check if this step should be visible yet
   const isVisible = requiredIndex < 0 || currentIndex >= requiredIndex;
   
-  const isActive = status === currentStep;
+  // Special handling: checking_queue and queue_full_waiting should activate the "queued" step
+  const isActive = status === currentStep || 
+                   (currentStep === 'queued' && (status === 'checking_queue' || status === 'queue_full_waiting'));
   const isCompleted = completedSteps.includes(status);
   
   return (
