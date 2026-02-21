@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { Upload, AlertCircle, CheckCircle, Loader2, Download, X } from 'lucide-react';
 
 // Types
-type ProcessingStatus = 'idle' | 'uploading' | 'splitting' | 'adding_watermarks' | 'finished' | 'error';
+type ProcessingStatus = 'idle' | 'queued' | 'uploading' | 'splitting' | 'adding_watermarks' | 'downloading' | 'finished' | 'error';
 
 interface HistoryItem {
   id: string;
@@ -12,6 +12,13 @@ interface HistoryItem {
   downloadUrl: string;
   downloadFailed: boolean;
   jobId?: string;
+  expiryTimer?: ReturnType<typeof setTimeout>;
+}
+
+interface QueueInfo {
+  position: number;
+  jobsAhead: number;
+  estimatedWaitSeconds: number | null;
 }
 
 export default function App() {
@@ -26,10 +33,12 @@ export default function App() {
   const [usedColors, setUsedColors] = useState<Set<string>>(new Set());
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
   const [showDownloadButton, setShowDownloadButton] = useState(false);
+  const [showExpiryWarning, setShowExpiryWarning] = useState(false);
+  const [queueInfo, setQueueInfo] = useState<QueueInfo | null>(null);
   const [backendAwake, setBackendAwake] = useState(false);
   const [wakingBackend, setWakingBackend] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const pollingRef = useRef<NodeJS.Timeout | null>(null);
+  const pollingRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Use environment variable for API URL, fallback to localhost for development
   // In production (GitHub Pages), use the Render backend URL
@@ -40,6 +49,18 @@ export default function App() {
   useEffect(() => {
     wakeUpBackend();
   }, []);
+
+  // Cleanup timers on unmount
+  useEffect(() => {
+    return () => {
+      // Clear all expiry timers
+      history.forEach(item => {
+        if (item.expiryTimer) {
+          clearTimeout(item.expiryTimer);
+        }
+      });
+    };
+  }, [history]);
 
   const wakeUpBackend = async () => {
     setWakingBackend(true);
@@ -154,6 +175,8 @@ export default function App() {
       setProcessingStatus('uploading');
       setProgress(0);
       setShowDownloadButton(false);
+      setShowExpiryWarning(false);
+      setQueueInfo(null);
 
       // Upload file
       const formData = new FormData();
@@ -164,6 +187,20 @@ export default function App() {
         method: 'POST',
         body: formData
       });
+
+      // Handle 503 Server Busy
+      if (uploadResponse.status === 503) {
+        const errorData = await uploadResponse.json().catch(() => ({}));
+        const retryMinutes = errorData.retry_after_seconds 
+          ? Math.ceil(errorData.retry_after_seconds / 60) 
+          : 5;
+        setProcessingStatus('error');
+        setErrorMessage(
+          errorData.message || 
+          `Server is at capacity. Please try again in ${retryMinutes} minute${retryMinutes > 1 ? 's' : ''}.`
+        );
+        return;
+      }
 
       if (!uploadResponse.ok) {
         const errorData = await uploadResponse.json().catch(() => ({}));
@@ -203,6 +240,17 @@ export default function App() {
         return;
       }
 
+      // Extract queue information if queued
+      if (data.status === 'queued') {
+        setQueueInfo({
+          position: data.queue_position || 0,
+          jobsAhead: data.jobs_ahead || 0,
+          estimatedWaitSeconds: data.estimated_wait_seconds || null
+        });
+      } else {
+        setQueueInfo(null);
+      }
+
       setProcessingStatus(data.status as ProcessingStatus);
       setProgress(data.progress || 0);
 
@@ -212,7 +260,8 @@ export default function App() {
           clearTimeout(pollingRef.current);
         }
 
-        // Attempt automatic download
+        // Show downloading status and attempt automatic download
+        setProcessingStatus('downloading');
         await handleAutoDownload(jobId, originalFileName);
       } else {
         // Continue polling every 1 second
@@ -232,6 +281,13 @@ export default function App() {
     try {
       const response = await fetch(`${API_BASE}/api/download/${jobId}`);
       
+      // Handle 410 Gone (expired)
+      if (response.status === 410) {
+        setProcessingStatus('error');
+        setErrorMessage('Download expired. Please re-upload your PDF file.');
+        return;
+      }
+
       if (!response.ok) {
         throw new Error('Download failed');
       }
@@ -252,6 +308,9 @@ export default function App() {
       // Cleanup on backend
       await fetch(`${API_BASE}/api/cleanup/${jobId}`, { method: 'DELETE' });
 
+      // Set finished status
+      setProcessingStatus('finished');
+
       // Add to history without download button
       const newItem: HistoryItem = {
         id: Date.now().toString(),
@@ -265,7 +324,9 @@ export default function App() {
 
     } catch (error) {
       console.error('Auto-download failed:', error);
+      setProcessingStatus('finished'); // Still mark as finished
       setShowDownloadButton(true);
+      setShowExpiryWarning(true); // Show expiry warning when auto-download fails
       
       // Add to history with download button enabled
       const watermarkedName = originalFileName.replace('.pdf', '-watermarked.pdf');
@@ -278,6 +339,21 @@ export default function App() {
         downloadFailed: true,
         jobId: jobId
       };
+      
+      // Set 60-second timer to remove download button
+      const timer = setTimeout(() => {
+        setHistory(prev => prev.map(item =>
+          item.id === newItem.id 
+            ? { ...item, downloadFailed: false, jobId: undefined, expiryTimer: undefined }
+            : item
+        ));
+        if (showDownloadButton && currentJobId === jobId) {
+          setShowDownloadButton(false);
+          setShowExpiryWarning(false);
+        }
+      }, 60000);
+      
+      newItem.expiryTimer = timer;
       setHistory([newItem, ...history]);
       
       setErrorMessage('Automatic download failed. Please use the download button.');
@@ -287,6 +363,22 @@ export default function App() {
   const handleManualDownload = async (jobId: string, fileName: string) => {
     try {
       const response = await fetch(`${API_BASE}/api/download/${jobId}`);
+      
+      // Handle 410 Gone (expired)
+      if (response.status === 410) {
+        // Remove expired item from history
+        setHistory(prev => {
+          const item = prev.find(i => i.jobId === jobId);
+          if (item?.expiryTimer) {
+            clearTimeout(item.expiryTimer);
+          }
+          return prev.filter(i => i.jobId !== jobId);
+        });
+        setShowDownloadButton(false);
+        setShowExpiryWarning(false);
+        alert('Download expired. Please re-upload your PDF file.');
+        return;
+      }
       
       if (!response.ok) {
         throw new Error('Download failed');
@@ -306,11 +398,18 @@ export default function App() {
       // Cleanup on backend
       await fetch(`${API_BASE}/api/cleanup/${jobId}`, { method: 'DELETE' });
 
-      // Update history item to mark download as successful
-      setHistory(history.map(item => 
-        item.jobId === jobId ? { ...item, downloadFailed: false, jobId: undefined } : item
-      ));
+      // Update history item and clear expiry timer
+      setHistory(prev => prev.map(item => {
+        if (item.jobId === jobId) {
+          if (item.expiryTimer) {
+            clearTimeout(item.expiryTimer);
+          }
+          return { ...item, downloadFailed: false, jobId: undefined, expiryTimer: undefined };
+        }
+        return item;
+      }));
       setShowDownloadButton(false);
+      setShowExpiryWarning(false);
 
     } catch (error) {
       console.error('Manual download failed:', error);
@@ -353,6 +452,8 @@ export default function App() {
     setChunkSize('');
     setCurrentJobId(null);
     setShowDownloadButton(false);
+    setShowExpiryWarning(false);
+    setQueueInfo(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -492,12 +593,24 @@ export default function App() {
             </h2>
             
             <div className="space-y-6 mb-12">
+              {/* Queued */}
+              <ProcessingStep
+                status={processingStatus}
+                currentStep="queued"
+                completedSteps={['uploading', 'splitting', 'adding_watermarks', 'downloading', 'finished']}
+                label={queueInfo 
+                  ? `Queued - Position #${queueInfo.position} (${queueInfo.jobsAhead} job${queueInfo.jobsAhead !== 1 ? 's' : ''} ahead${queueInfo.estimatedWaitSeconds ? `, ~${Math.ceil(queueInfo.estimatedWaitSeconds / 60)} min` : ''})`
+                  : "Queued"}
+                progress={0}
+              />
+              
               {/* Uploading */}
               <ProcessingStep
                 status={processingStatus}
                 currentStep="uploading"
-                completedSteps={['splitting', 'adding_watermarks', 'finished']}
+                completedSteps={['splitting', 'adding_watermarks', 'downloading', 'finished']}
                 label="Uploading"
+                requiredStep="queued"
                 progress={progress}
               />
               
@@ -505,7 +618,7 @@ export default function App() {
               <ProcessingStep
                 status={processingStatus}
                 currentStep="splitting"
-                completedSteps={['adding_watermarks', 'finished']}
+                completedSteps={['adding_watermarks', 'downloading', 'finished']}
                 label="Splitting the PDF"
                 requiredStep="uploading"
                 progress={progress}
@@ -515,10 +628,20 @@ export default function App() {
               <ProcessingStep
                 status={processingStatus}
                 currentStep="adding_watermarks"
-                completedSteps={['finished']}
+                completedSteps={['downloading', 'finished']}
                 label="Adding watermarks"
                 requiredStep="splitting"
                 progress={progress}
+              />
+              
+              {/* Downloading */}
+              <ProcessingStep
+                status={processingStatus}
+                currentStep="downloading"
+                completedSteps={['finished']}
+                label="Downloading"
+                requiredStep="adding_watermarks"
+                progress={0}
               />
               
               {/* Completed - Always reserve space */}
@@ -543,6 +666,21 @@ export default function App() {
                   </div>
                 )}
               </div>
+
+              {/* Expiry Warning */}
+              {showExpiryWarning && (
+                <div className="bg-amber-50 border-2 border-amber-400 rounded-lg p-4 flex items-start gap-3">
+                  <div className="text-amber-600 mt-0.5">
+                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                    </svg>
+                  </div>
+                  <div>
+                    <h3 className="text-amber-800 font-semibold text-lg mb-1">Download Immediately!</h3>
+                    <p className="text-amber-700">Your file will expire in 1 minute. Download it now before it's gone.</p>
+                  </div>
+                </div>
+              )}
 
               {/* Manual Download Button */}
               {showDownloadButton && currentJobId && selectedFile && (
@@ -593,7 +731,7 @@ interface ProcessingStepProps {
 }
 
 function ProcessingStep({ status, currentStep, completedSteps, label, requiredStep, progress = 0 }: ProcessingStepProps) {
-  const stepOrder: ProcessingStatus[] = ['idle', 'uploading', 'splitting', 'adding_watermarks', 'finished'];
+  const stepOrder: ProcessingStatus[] = ['idle', 'queued', 'uploading', 'splitting', 'adding_watermarks', 'downloading', 'finished'];
   const currentIndex = stepOrder.indexOf(status);
   const requiredIndex = requiredStep ? stepOrder.indexOf(requiredStep) : -1;
   
