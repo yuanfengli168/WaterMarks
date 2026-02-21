@@ -32,7 +32,9 @@ export default function App() {
   const pollingRef = useRef<NodeJS.Timeout | null>(null);
 
   // Use environment variable for API URL, fallback to localhost for development
-  const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+  // In production (GitHub Pages), use the Render backend URL
+  const API_BASE = import.meta.env.VITE_API_BASE_URL || 
+    (import.meta.env.PROD ? 'https://watermarks-backend.onrender.com' : 'http://localhost:8000');
 
   // Wake up backend on component mount
   useEffect(() => {
