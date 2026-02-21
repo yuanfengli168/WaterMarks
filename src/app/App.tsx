@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { Upload, AlertCircle, CheckCircle, Loader2, Download, X } from 'lucide-react';
 
 // Types
-type ProcessingStatus = 'idle' | 'queued' | 'uploading' | 'splitting' | 'adding_watermarks' | 'downloading' | 'finished' | 'error';
+type ProcessingStatus = 'idle' | 'queued' | 'uploading' | 'splitting' | 'adding_watermarks' | 'merging' | 'downloading' | 'finished' | 'error';
 
 interface HistoryItem {
   id: string;
@@ -68,6 +68,7 @@ export default function App() {
       // Try health check first
       const healthResponse = await fetch(`${API_BASE}/health`, {
         method: 'GET',
+        credentials: 'include',
         signal: AbortSignal.timeout(30000) // 30 second timeout
       });
       
@@ -84,6 +85,7 @@ export default function App() {
       try {
         const pingResponse = await fetch(`${API_BASE}/ping`, {
           method: 'GET',
+          credentials: 'include',
           signal: AbortSignal.timeout(30000)
         });
         if (pingResponse.ok) {
@@ -148,6 +150,7 @@ export default function App() {
     try {
       const response = await fetch(`${API_BASE}/api/check-size`, {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ file_size: file.size })
       });
@@ -178,14 +181,43 @@ export default function App() {
       setShowExpiryWarning(false);
       setQueueInfo(null);
 
-      // Upload file
+      // Upload file with XMLHttpRequest to track progress
       const formData = new FormData();
       formData.append('file', file);
       formData.append('chunk_size', chunkSize);
 
-      const uploadResponse = await fetch(`${API_BASE}/api/upload`, {
-        method: 'POST',
-        body: formData
+      // Use XMLHttpRequest for upload progress tracking
+      const uploadResponse = await new Promise<Response>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        
+        // Track upload progress
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) {
+            const percentComplete = Math.round((e.loaded / e.total) * 100);
+            setProgress(percentComplete);
+          }
+        };
+        
+        xhr.onload = () => {
+          // Convert XMLHttpRequest to fetch-like Response
+          const response = new Response(xhr.response, {
+            status: xhr.status,
+            statusText: xhr.statusText,
+            headers: new Headers(xhr.getAllResponseHeaders().split('\r\n').reduce((acc, line) => {
+              const [key, value] = line.split(': ');
+              if (key && value) acc[key] = value;
+              return acc;
+            }, {} as Record<string, string>))
+          });
+          resolve(response);
+        };
+        
+        xhr.onerror = () => reject(new Error('Upload failed'));
+        xhr.ontimeout = () => reject(new Error('Upload timeout'));
+        
+        xhr.open('POST', `${API_BASE}/api/upload`);
+        xhr.withCredentials = true; // Include credentials (cookies)
+        xhr.send(formData);
       });
 
       // Handle 503 Server Busy
@@ -222,7 +254,9 @@ export default function App() {
 
   const pollStatus = async (jobId: string, originalFileName: string) => {
     try {
-      const response = await fetch(`${API_BASE}/api/status/${jobId}`);
+      const response = await fetch(`${API_BASE}/api/status/${jobId}`, {
+        credentials: 'include'
+      });
       
       if (!response.ok) {
         throw new Error('Failed to fetch status');
@@ -279,7 +313,9 @@ export default function App() {
 
   const handleAutoDownload = async (jobId: string, originalFileName: string) => {
     try {
-      const response = await fetch(`${API_BASE}/api/download/${jobId}`);
+      const response = await fetch(`${API_BASE}/api/download/${jobId}`, {
+        credentials: 'include'
+      });
       
       // Handle 410 Gone (expired)
       if (response.status === 410) {
@@ -305,8 +341,10 @@ export default function App() {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
 
-      // Cleanup on backend
-      await fetch(`${API_BASE}/api/cleanup/${jobId}`, { method: 'DELETE' });
+      // Cleanup on backend (no credentials to avoid CORS preflight)
+      await fetch(`${API_BASE}/api/cleanup/${jobId}`, { 
+        method: 'DELETE'
+      });
 
       // Set finished status
       setProcessingStatus('finished');
@@ -362,7 +400,9 @@ export default function App() {
 
   const handleManualDownload = async (jobId: string, fileName: string) => {
     try {
-      const response = await fetch(`${API_BASE}/api/download/${jobId}`);
+      const response = await fetch(`${API_BASE}/api/download/${jobId}`, {
+        credentials: 'include'
+      });
       
       // Handle 410 Gone (expired)
       if (response.status === 410) {
@@ -395,8 +435,10 @@ export default function App() {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
 
-      // Cleanup on backend
-      await fetch(`${API_BASE}/api/cleanup/${jobId}`, { method: 'DELETE' });
+      // Cleanup on backend (no credentials to avoid CORS preflight)
+      await fetch(`${API_BASE}/api/cleanup/${jobId}`, { 
+        method: 'DELETE'
+      });
 
       // Update history item and clear expiry timer
       setHistory(prev => prev.map(item => {
@@ -427,7 +469,9 @@ export default function App() {
     // Cleanup job if exists
     if (currentJobId) {
       try {
-        await fetch(`${API_BASE}/api/cleanup/${currentJobId}`, { method: 'DELETE' });
+        await fetch(`${API_BASE}/api/cleanup/${currentJobId}`, { 
+          method: 'DELETE'
+        });
       } catch (error) {
         console.error('Cleanup error:', error);
       }
@@ -597,7 +641,7 @@ export default function App() {
               <ProcessingStep
                 status={processingStatus}
                 currentStep="queued"
-                completedSteps={['uploading', 'splitting', 'adding_watermarks', 'downloading', 'finished']}
+                completedSteps={['uploading', 'splitting', 'adding_watermarks', 'merging', 'downloading', 'finished']}
                 label={queueInfo 
                   ? `Queued - Position #${queueInfo.position} (${queueInfo.jobsAhead} job${queueInfo.jobsAhead !== 1 ? 's' : ''} ahead${queueInfo.estimatedWaitSeconds ? `, ~${Math.ceil(queueInfo.estimatedWaitSeconds / 60)} min` : ''})`
                   : "Queued"}
@@ -608,7 +652,7 @@ export default function App() {
               <ProcessingStep
                 status={processingStatus}
                 currentStep="uploading"
-                completedSteps={['splitting', 'adding_watermarks', 'downloading', 'finished']}
+                completedSteps={['splitting', 'adding_watermarks', 'merging', 'downloading', 'finished']}
                 label="Uploading"
                 requiredStep="queued"
                 progress={progress}
@@ -618,7 +662,7 @@ export default function App() {
               <ProcessingStep
                 status={processingStatus}
                 currentStep="splitting"
-                completedSteps={['adding_watermarks', 'downloading', 'finished']}
+                completedSteps={['adding_watermarks', 'merging', 'downloading', 'finished']}
                 label="Splitting the PDF"
                 requiredStep="uploading"
                 progress={progress}
@@ -628,9 +672,19 @@ export default function App() {
               <ProcessingStep
                 status={processingStatus}
                 currentStep="adding_watermarks"
-                completedSteps={['downloading', 'finished']}
+                completedSteps={['merging', 'downloading', 'finished']}
                 label="Adding watermarks"
                 requiredStep="splitting"
+                progress={progress}
+              />
+              
+              {/* Merging chunks */}
+              <ProcessingStep
+                status={processingStatus}
+                currentStep="merging"
+                completedSteps={['downloading', 'finished']}
+                label="Merging chunks"
+                requiredStep="adding_watermarks"
                 progress={progress}
               />
               
@@ -640,7 +694,7 @@ export default function App() {
                 currentStep="downloading"
                 completedSteps={['finished']}
                 label="Downloading"
-                requiredStep="adding_watermarks"
+                requiredStep="merging"
                 progress={0}
               />
               
@@ -731,7 +785,7 @@ interface ProcessingStepProps {
 }
 
 function ProcessingStep({ status, currentStep, completedSteps, label, requiredStep, progress = 0 }: ProcessingStepProps) {
-  const stepOrder: ProcessingStatus[] = ['idle', 'queued', 'uploading', 'splitting', 'adding_watermarks', 'downloading', 'finished'];
+  const stepOrder: ProcessingStatus[] = ['idle', 'queued', 'uploading', 'splitting', 'adding_watermarks', 'merging', 'downloading', 'finished'];
   const currentIndex = stepOrder.indexOf(status);
   const requiredIndex = requiredStep ? stepOrder.indexOf(requiredStep) : -1;
   
