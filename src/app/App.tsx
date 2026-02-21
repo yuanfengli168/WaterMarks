@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { Upload, AlertCircle, CheckCircle, Loader2, Download, X } from 'lucide-react';
 
 // Types
@@ -26,10 +26,54 @@ export default function App() {
   const [usedColors, setUsedColors] = useState<Set<string>>(new Set());
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
   const [showDownloadButton, setShowDownloadButton] = useState(false);
+  const [backendAwake, setBackendAwake] = useState(false);
+  const [wakingBackend, setWakingBackend] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollingRef = useRef<NodeJS.Timeout | null>(null);
 
-  const API_BASE = 'http://localhost:8000';
+  // Use environment variable for API URL, fallback to localhost for development
+  const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+
+  // Wake up backend on component mount
+  useEffect(() => {
+    wakeUpBackend();
+  }, []);
+
+  const wakeUpBackend = async () => {
+    setWakingBackend(true);
+    try {
+      // Try health check first
+      const healthResponse = await fetch(`${API_BASE}/health`, {
+        method: 'GET',
+        signal: AbortSignal.timeout(30000) // 30 second timeout
+      });
+      
+      if (healthResponse.ok) {
+        setBackendAwake(true);
+      } else {
+        throw new Error('Backend not responding');
+      }
+    } catch (error) {
+      console.error('Backend wake-up error:', error);
+      // Try ping endpoint as fallback
+      try {
+        const pingResponse = await fetch(`${API_BASE}/ping`, {
+          method: 'GET',
+          signal: AbortSignal.timeout(30000)
+        });
+        if (pingResponse.ok) {
+          setBackendAwake(true);
+        }
+      } catch (pingError) {
+        console.error('Ping failed:', pingError);
+        setHomeErrorMessage('Backend is waking up. This may take up to 50 seconds. Please wait...');
+        // Retry after delay
+        setTimeout(() => wakeUpBackend(), 5000);
+      }
+    } finally {
+      setWakingBackend(false);
+    }
+  };
 
   // Color pool for watermarks
   const colorPool = [
@@ -330,8 +374,20 @@ export default function App() {
                 Please upload your pdf here, and choose your chunk size to add colorful water marks!
               </h1>
               
+              {/* Backend status message */}
+              {wakingBackend && (
+                <div className="max-w-md mx-auto mb-6 p-4 bg-blue-50 border-2 border-blue-500 rounded-lg">
+                  <div className="flex items-start gap-3">
+                    <Loader2 className="w-5 h-5 text-blue-600 flex-shrink-0 mt-0.5 animate-spin" />
+                    <div className="text-sm text-blue-700 text-left">
+                      Waking up backend server... This may take up to 50 seconds for the first request.
+                    </div>
+                  </div>
+                </div>
+              )}
+              
               {/* Error message display */}
-              {homeErrorMessage && (
+              {homeErrorMessage && !wakingBackend && (
                 <div className="max-w-md mx-auto mb-6 p-4 bg-red-50 border-2 border-red-500 rounded-lg">
                   <div className="flex items-start gap-3">
                     <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
@@ -366,10 +422,20 @@ export default function App() {
                 
                 <button
                   type="submit"
-                  className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-4 px-6 rounded-lg transition-colors duration-200 flex items-center justify-center gap-3 shadow-lg hover:shadow-xl"
+                  disabled={!backendAwake || wakingBackend}
+                  className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white font-semibold py-4 px-6 rounded-lg transition-colors duration-200 flex items-center justify-center gap-3 shadow-lg hover:shadow-xl disabled:hover:shadow-lg"
                 >
-                  <Upload className="w-5 h-5" />
-                  Upload PDF
+                  {wakingBackend ? (
+                    <>
+                      <Loader2 className="w-5 h-5 animate-spin" />
+                      Connecting to Backend...
+                    </>
+                  ) : (
+                    <>
+                      <Upload className="w-5 h-5" />
+                      Upload PDF
+                    </>
+                  )}
                 </button>
               </form>
             </div>
