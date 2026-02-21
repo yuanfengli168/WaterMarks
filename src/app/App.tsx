@@ -61,6 +61,7 @@ export default function App() {
   const pollingRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const queueCheckIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const queueCheckTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryAttemptRef = useRef<number>(0);
 
   // Use environment variable for API URL, fallback to localhost for development
   // In production (GitHub Pages), use the Render backend URL
@@ -186,12 +187,15 @@ export default function App() {
           // If queue is available now, proceed
           if (checkResult.queue_available) {
             setQueueWaitInfo(null);
+            retryAttemptRef.current = 0; // Reset retry counter
             resolve(true);
             return;
           }
 
           // Queue still full - update wait info and continue
-          const retrySeconds = checkResult.retry_after_seconds || 30;
+          // Progressive retry: 5s for first attempt, 10s for subsequent attempts
+          retryAttemptRef.current += 1;
+          const retrySeconds = retryAttemptRef.current === 1 ? 5 : 10;
           setQueueWaitInfo({
             activeJobs: checkResult.active_jobs,
             queueCount: checkResult.queue_count,
@@ -278,9 +282,20 @@ export default function App() {
       setShowExpiryWarning(false);
       setQueueInfo(null);
       setQueueWaitInfo(null);
+      retryAttemptRef.current = 0; // Reset retry counter
 
-      // Queue available - proceed with upload
+      // Queue available - show brief "ready to upload" message for 3 seconds
       if (checkResult.queue_available) {
+        setProcessingStatus('queued');
+        setQueueInfo({
+          position: 0, // Will be assigned after upload
+          jobsAhead: 0,
+          estimatedWaitSeconds: 0
+        });
+        
+        // Wait 3 seconds before starting upload
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        
         startProcessing(file);
         return;
       }
@@ -304,7 +319,17 @@ export default function App() {
       const spaceAvailable = await waitForQueueSpace(file);
       
       if (spaceAvailable) {
-        // Space became available - start upload
+        // Space became available - show brief message before starting upload
+        setProcessingStatus('queued');
+        setQueueInfo({
+          position: 0,
+          jobsAhead: 0,
+          estimatedWaitSeconds: 0
+        });
+        
+        // Wait 3 seconds before starting upload
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        
         startProcessing(file);
       }
       // If not available, error is already set by waitForQueueSpace
@@ -384,7 +409,17 @@ export default function App() {
         const spaceAvailable = await waitForQueueSpace(file);
         
         if (spaceAvailable) {
-          // Space became available - retry upload
+          // Space became available - show brief message before retrying upload
+          setProcessingStatus('queued');
+          setQueueInfo({
+            position: 0,
+            jobsAhead: 0,
+            estimatedWaitSeconds: 0
+          });
+          
+          // Wait 3 seconds before retrying upload
+          await new Promise(resolve => setTimeout(resolve, 3000));
+          
           await startProcessing(file);
         } else {
           // Error already set by waitForQueueSpace or user cancelled
@@ -486,7 +521,36 @@ export default function App() {
         throw new Error('Download failed');
       }
 
-      const blob = await response.blob();
+      // Get total size from Content-Length header
+      const contentLength = response.headers.get('Content-Length');
+      const total = contentLength ? parseInt(contentLength, 10) : 0;
+      
+      if (!response.body) {
+        throw new Error('Response body is null');
+      }
+
+      // Track download progress
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let receivedLength = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        
+        if (done) break;
+        
+        chunks.push(value);
+        receivedLength += value.length;
+        
+        // Update progress (only if we know total size)
+        if (total > 0) {
+          const percentage = Math.round((receivedLength / total) * 100);
+          setProgress(percentage);
+        }
+      }
+
+      // Combine chunks into blob
+      const blob = new Blob(chunks as BlobPart[], { type: 'application/pdf' });
       const url = URL.createObjectURL(blob);
       const watermarkedName = originalFileName.replace('.pdf', '-watermarked.pdf');
       
@@ -558,33 +622,60 @@ export default function App() {
 
   const handleManualDownload = async (jobId: string, fileName: string) => {
     try {
+      // Set downloading status to show progress
+      setProcessingStatus('downloading');
+      setProgress(0);
+      
       const response = await fetch(`${API_BASE}/api/download/${jobId}`, {
         credentials: 'include'
       });
       
       // Handle 410 Gone (expired)
       if (response.status === 410) {
-        // Remove expired item from history
-        setHistory(prev => {
-          const item = prev.find(i => i.jobId === jobId);
-          if (item?.expiryTimer) {
-            clearTimeout(item.expiryTimer);
-          }
-          return prev.filter(i => i.jobId !== jobId);
-        });
         setShowDownloadButton(false);
         setShowExpiryWarning(false);
-        alert('Download expired. Please re-upload your PDF file.');
+        setProcessingStatus('error');
+        setErrorMessage('Download expired (1 minute limit). Please re-upload your PDF file.');
         return;
       }
-      
+
       if (!response.ok) {
         throw new Error('Download failed');
       }
 
-      const blob = await response.blob();
+      // Get total size from Content-Length header
+      const contentLength = response.headers.get('Content-Length');
+      const total = contentLength ? parseInt(contentLength, 10) : 0;
+      
+      if (!response.body) {
+        throw new Error('Response body is null');
+      }
+
+      // Track download progress
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let receivedLength = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        
+        if (done) break;
+        
+        chunks.push(value);
+        receivedLength += value.length;
+        
+        // Update progress (only if we know total size)
+        if (total > 0) {
+          const percentage = Math.round((receivedLength / total) * 100);
+          setProgress(percentage);
+        }
+      }
+
+      // Combine chunks into blob
+      const blob = new Blob(chunks as BlobPart[], { type: 'application/pdf' });
       const url = URL.createObjectURL(blob);
       
+      // Trigger download
       const a = document.createElement('a');
       a.href = url;
       a.download = fileName;
@@ -827,7 +918,9 @@ export default function App() {
                     ? 'Checking queue availability...'
                     : processingStatus === 'queue_full_waiting' && queueWaitInfo
                     ? `Waiting for queue space (${queueWaitInfo.activeJobs} processing, ${queueWaitInfo.queueCount} queued) - Retry in ${Math.floor(queueWaitInfo.countdownSeconds / 60)}:${(queueWaitInfo.countdownSeconds % 60).toString().padStart(2, '0')}`
-                    : queueInfo 
+                    : processingStatus === 'queued' && queueInfo && queueInfo.position === 0
+                    ? 'Ready to upload - Starting immediately...'
+                    : processingStatus === 'queued' && queueInfo 
                     ? `Queued - Position #${queueInfo.position} (${queueInfo.jobsAhead} job${queueInfo.jobsAhead !== 1 ? 's' : ''} ahead${queueInfo.estimatedWaitSeconds ? `, ~${Math.ceil(queueInfo.estimatedWaitSeconds / 60)} min` : ''})`
                     : 'Queued'
                 }
@@ -881,7 +974,7 @@ export default function App() {
                 completedSteps={['finished']}
                 label="Downloading"
                 requiredStep="merging"
-                progress={0}
+                progress={progress}
               />
               
               {/* Completed - Always reserve space */}
