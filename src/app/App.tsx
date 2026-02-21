@@ -294,7 +294,7 @@ export default function App() {
         });
         
         // Wait 3 seconds before starting upload
-        await new Promise(resolve => setTimeout(resolve, 3000));
+        await new Promise(resolve => setTimeout(resolve, 1500));
         
         startProcessing(file);
         return;
@@ -920,11 +920,10 @@ export default function App() {
                     ? `Waiting for queue space (${queueWaitInfo.activeJobs} processing, ${queueWaitInfo.queueCount} queued) - Retry in ${Math.floor(queueWaitInfo.countdownSeconds / 60)}:${(queueWaitInfo.countdownSeconds % 60).toString().padStart(2, '0')}`
                     : processingStatus === 'queued' && queueInfo && queueInfo.position === 0
                     ? 'Ready to upload - Starting immediately...'
-                    : processingStatus === 'queued' && queueInfo 
-                    ? `Queued - Position #${queueInfo.position} (${queueInfo.jobsAhead} job${queueInfo.jobsAhead !== 1 ? 's' : ''} ahead${queueInfo.estimatedWaitSeconds ? `, ~${Math.ceil(queueInfo.estimatedWaitSeconds / 60)} min` : ''})`
                     : 'Queued'
                 }
                 progress={0}
+                queueInfo={queueInfo}
               />
               
               {/* Uploading */}
@@ -935,6 +934,23 @@ export default function App() {
                 label="Uploading"
                 requiredStep="queued"
                 progress={progress}
+                queueInfo={queueInfo}
+              />
+              
+              {/* Processing (shows queue position after upload) */}
+              <ProcessingStep
+                status={processingStatus}
+                currentStep="queued"
+                completedSteps={['splitting', 'adding_watermarks', 'merging', 'downloading', 'finished']}
+                label={
+                  processingStatus === 'queued' && queueInfo && queueInfo.position > 0
+                    ? `Processing - Position #${queueInfo.position} (${queueInfo.jobsAhead} job${queueInfo.jobsAhead !== 1 ? 's' : ''} ahead${queueInfo.estimatedWaitSeconds ? `, ~${Math.ceil(queueInfo.estimatedWaitSeconds / 60)} min` : ''})`
+                    : 'Processing'
+                }
+                requiredStep="uploading"
+                progress={0}
+                isPostUploadQueue={true}
+                queueInfo={queueInfo}
               />
               
               {/* Splitting the PDF */}
@@ -945,6 +961,7 @@ export default function App() {
                 label="Splitting the PDF"
                 requiredStep="uploading"
                 progress={progress}
+                queueInfo={queueInfo}
               />
               
               {/* Adding watermarks */}
@@ -955,6 +972,7 @@ export default function App() {
                 label="Adding watermarks"
                 requiredStep="splitting"
                 progress={progress}
+                queueInfo={queueInfo}
               />
               
               {/* Merging chunks */}
@@ -965,6 +983,7 @@ export default function App() {
                 label="Merging chunks"
                 requiredStep="adding_watermarks"
                 progress={progress}
+                queueInfo={queueInfo}
               />
               
               {/* Downloading */}
@@ -975,6 +994,7 @@ export default function App() {
                 label="Downloading"
                 requiredStep="merging"
                 progress={progress}
+                queueInfo={queueInfo}
               />
               
               {/* Completed - Always reserve space */}
@@ -1061,20 +1081,54 @@ interface ProcessingStepProps {
   label: string;
   requiredStep?: ProcessingStatus;
   progress?: number;
+  isPostUploadQueue?: boolean; // Special flag for post-upload queue step (Processing)
+  queueInfo?: QueueInfo | null;
 }
 
-function ProcessingStep({ status, currentStep, completedSteps, label, requiredStep, progress = 0 }: ProcessingStepProps) {
+function ProcessingStep({ status, currentStep, completedSteps, label, requiredStep, progress = 0, isPostUploadQueue = false, queueInfo }: ProcessingStepProps) {
   const stepOrder: ProcessingStatus[] = ['idle', 'checking_queue', 'queue_full_waiting', 'queued', 'uploading', 'splitting', 'adding_watermarks', 'merging', 'downloading', 'finished'];
   const currentIndex = stepOrder.indexOf(status);
   const requiredIndex = requiredStep ? stepOrder.indexOf(requiredStep) : -1;
   
   // Check if this step should be visible yet
-  const isVisible = requiredIndex < 0 || currentIndex >= requiredIndex;
+  // Special handling for post-upload queue state (status='queued' with position > 0)
+  const isPostUploadQueueState = status === 'queued' && queueInfo && queueInfo.position > 0;
   
-  // Special handling: checking_queue and queue_full_waiting should activate the "queued" step
-  const isActive = status === currentStep || 
-                   (currentStep === 'queued' && (status === 'checking_queue' || status === 'queue_full_waiting'));
-  const isCompleted = completedSteps.includes(status);
+  let isVisible: boolean;
+  if (isPostUploadQueue && isPostUploadQueueState) {
+    // Processing step should be visible when in post-upload queue
+    isVisible = true;
+  } else if (isPostUploadQueueState && requiredStep && requiredStep !== 'queued') {
+    // All steps after Queued should be visible when in post-upload queue
+    isVisible = true;
+  } else {
+    isVisible = requiredIndex < 0 || currentIndex >= requiredIndex;
+  }
+  
+  // Special handling for Queued vs Processing steps
+  let isActive: boolean;
+  if (currentStep === 'queued') {
+    if (isPostUploadQueue) {
+      // Processing step: active when status='queued' AND position > 0 (after upload)
+      isActive = status === 'queued' && queueInfo !== null && queueInfo !== undefined && queueInfo.position > 0;
+    } else {
+      // Queued step: active when checking queue or waiting, or when position = 0
+      isActive = status === 'checking_queue' || status === 'queue_full_waiting' || 
+                 (status === 'queued' && (!queueInfo || queueInfo.position === 0));
+    }
+  } else {
+    isActive = status === currentStep;
+  }
+  
+  // Determine if step is completed
+  // Special case: Queued step and Uploading step should be completed when status='queued' with position > 0
+  let isCompleted: boolean;
+  if (status === 'queued' && queueInfo && queueInfo.position > 0) {
+    // Post-upload queue: Queued and Uploading are completed
+    isCompleted = currentStep === 'queued' || currentStep === 'uploading';
+  } else {
+    isCompleted = completedSteps.includes(status);
+  }
   
   return (
     <div className={`rounded-lg border-2 transition-all duration-300 min-h-[60px] ${
