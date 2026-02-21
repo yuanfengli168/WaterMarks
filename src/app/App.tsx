@@ -258,27 +258,26 @@ export default function App() {
       return;
     }
 
-    // Move to processing stage and start queue checking
-    setSelectedFile(file);
-    setHomeErrorMessage('');
-    setCurrentStage('processing');
-    setProcessingStatus('checking_queue');
-    setProgress(0);
-    setShowDownloadButton(false);
-    setShowExpiryWarning(false);
-    setQueueInfo(null);
-    setQueueWaitInfo(null);
-
-    // Check queue availability before uploading
+    // Check file size FIRST while staying on homepage
     try {
       const checkResult = await checkQueueAvailability(file);
 
-      // File too large - stop immediately
-      if (!checkResult.allowed && checkResult.queue_available) {
-        setProcessingStatus('error');
-        setErrorMessage(checkResult.message);
+      // File too large - show error on HOMEPAGE, don't move to processing stage
+      if (!checkResult.allowed) {
+        setHomeErrorMessage(checkResult.message);
         return;
       }
+
+      // Size OK - move to processing stage
+      setSelectedFile(file);
+      setHomeErrorMessage('');
+      setCurrentStage('processing');
+      setProcessingStatus('checking_queue');
+      setProgress(0);
+      setShowDownloadButton(false);
+      setShowExpiryWarning(false);
+      setQueueInfo(null);
+      setQueueWaitInfo(null);
 
       // Queue available - proceed with upload
       if (checkResult.queue_available) {
@@ -312,8 +311,7 @@ export default function App() {
 
     } catch (error) {
       console.error('Queue check error:', error);
-      setProcessingStatus('error');
-      setErrorMessage('Failed to check queue status. Please try again.');
+      setHomeErrorMessage('Failed to check queue status. Please try again.');
     }
   };
 
