@@ -632,11 +632,11 @@ export default function App() {
         {/* Stage 2: Processing View */}
         {currentStage === 'processing' && (
           <div className="bg-white rounded-2xl shadow-xl p-12">
-            <h2 className="text-2xl font-bold text-gray-800 mb-8 text-center">
+            <h2 className="text-2xl font-bold text-gray-800 mb-6 text-center">
               Processing Your PDF
             </h2>
             
-            <div className="space-y-6 mb-12">
+            <div className="space-y-3 mb-8">
               {/* Queued */}
               <ProcessingStep
                 status={processingStatus}
@@ -699,22 +699,22 @@ export default function App() {
               />
               
               {/* Completed - Always reserve space */}
-              <div className="min-h-[72px] flex items-center">
+              <div className="min-h-[60px] flex items-center">
                 {processingStatus === 'finished' && (
-                  <div className="flex items-center gap-4 p-4 bg-green-50 rounded-lg border-2 border-green-500 w-full">
-                    <CheckCircle className="w-6 h-6 text-green-600 flex-shrink-0" />
-                    <span className="text-lg font-medium text-green-800">Completed</span>
+                  <div className="flex items-center gap-3 p-3 bg-green-50 rounded-lg border-2 border-green-500 w-full">
+                    <CheckCircle className="w-5 h-5 text-green-600 flex-shrink-0" />
+                    <span className="text-base font-medium text-green-800">Completed</span>
                   </div>
                 )}
               </div>
               
               {/* Error - Always reserve space */}
-              <div className="min-h-[72px] flex items-start">
+              <div className="min-h-[60px] flex items-start">
                 {processingStatus === 'error' && (
-                  <div className="flex items-start gap-4 p-4 bg-red-50 rounded-lg border-2 border-red-500 w-full">
-                    <AlertCircle className="w-6 h-6 text-red-600 flex-shrink-0 mt-0.5" />
+                  <div className="flex items-start gap-3 p-3 bg-red-50 rounded-lg border-2 border-red-500 w-full">
+                    <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
                     <div>
-                      <div className="text-lg font-medium text-red-800 mb-1">Error occurred</div>
+                      <div className="text-base font-medium text-red-800 mb-1">Error occurred</div>
                       <div className="text-sm text-red-700">{errorMessage}</div>
                     </div>
                   </div>
@@ -796,7 +796,7 @@ function ProcessingStep({ status, currentStep, completedSteps, label, requiredSt
   const isCompleted = completedSteps.includes(status);
   
   return (
-    <div className={`rounded-lg border-2 transition-all duration-300 min-h-[72px] ${
+    <div className={`rounded-lg border-2 transition-all duration-300 min-h-[60px] ${
       !isVisible
         ? 'opacity-0 pointer-events-none bg-white border-gray-200'
         : isActive 
@@ -805,15 +805,15 @@ function ProcessingStep({ status, currentStep, completedSteps, label, requiredSt
         ? 'bg-gray-50 border-gray-300' 
         : 'bg-white border-gray-200'
     }`}>
-      <div className="flex items-center gap-4 p-4">
+      <div className="flex items-center gap-3 p-3">
         {isActive ? (
-          <Loader2 className="w-6 h-6 text-blue-600 animate-spin flex-shrink-0" />
+          <Loader2 className="w-5 h-5 text-blue-600 animate-spin flex-shrink-0" />
         ) : isCompleted ? (
-          <CheckCircle className="w-6 h-6 text-gray-400 flex-shrink-0" />
+          <CheckCircle className="w-5 h-5 text-gray-400 flex-shrink-0" />
         ) : (
-          <div className="w-6 h-6 rounded-full border-2 border-gray-300 flex-shrink-0" />
+          <div className="w-5 h-5 rounded-full border-2 border-gray-300 flex-shrink-0" />
         )}
-        <span className={`text-lg font-medium ${
+        <span className={`text-base font-medium ${
           isActive ? 'text-blue-800' : isCompleted ? 'text-gray-600' : 'text-gray-400'
         }`}>
           {label}
@@ -821,14 +821,14 @@ function ProcessingStep({ status, currentStep, completedSteps, label, requiredSt
       </div>
       {/* Progress bar for active step */}
       {isActive && progress > 0 && (
-        <div className="px-4 pb-4">
-          <div className="w-full bg-blue-200 rounded-full h-2.5">
+        <div className="px-3 pb-3">
+          <div className="w-full bg-blue-200 rounded-full h-2">
             <div 
-              className="bg-blue-600 h-2.5 rounded-full transition-all duration-300"
+              className="bg-blue-600 h-2 rounded-full transition-all duration-300"
               style={{ width: `${progress}%` }}
             ></div>
           </div>
-          <div className="text-xs text-blue-600 mt-1 text-right">{progress}%</div>
+          <div className="text-xs text-blue-600 mt-0.5 text-right">{progress}%</div>
         </div>
       )}
     </div>
