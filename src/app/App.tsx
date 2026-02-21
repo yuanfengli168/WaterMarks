@@ -52,6 +52,8 @@ export default function App() {
       
       if (healthResponse.ok) {
         setBackendAwake(true);
+        setHomeErrorMessage(''); // Clear any previous error
+        return; // Stop here, backend is awake
       } else {
         throw new Error('Backend not responding');
       }
@@ -65,11 +67,15 @@ export default function App() {
         });
         if (pingResponse.ok) {
           setBackendAwake(true);
+          setHomeErrorMessage(''); // Clear any previous error
+          return; // Stop here, backend is awake
+        } else {
+          throw new Error('Ping not responding');
         }
       } catch (pingError) {
         console.error('Ping failed:', pingError);
         setHomeErrorMessage('Backend is waking up. This may take up to 50 seconds. Please wait...');
-        // Retry after delay
+        // Retry after delay only if both failed
         setTimeout(() => wakeUpBackend(), 5000);
       }
     } finally {
